@@ -168,7 +168,8 @@ class MastDataset(Dataset):
         store_manager_settings : StoreManagerParametersType | None
             Settings for the store manager instance provided as a kwargs dictionary, with keywords and required value
             types as defined in `MAST_tools.data_models.StoreManagerParametersType`. Only valid (keyword, value)
-            pairs are used to update default values, e.g. {"target_fsspec_protocol": "s3"}.
+            pairs are used to update default values, e.g. {"target_fsspec_protocol": "s3"}. This includes
+            "data_format" ("zarr" or "netcdf") to select the on-disk/S3 data format to load via xarray.
             Optional. Default: None, which results in the default values for all the keywords as defined in
             `MAST_tools.store_utils.MASTStorageManager.__init__`.
         verbose : bool
@@ -233,11 +234,6 @@ class MastDataset(Dataset):
 
         """
 
-        store_manager = self.sig.store_manager
-        store = store_manager.make_shot_store(
-            shot_info=ShotInfo(shot_id=self.shots_list[idx], local=self.local), verbose=self.verbose
-        )
-
         shot = {}
 
         # Removing outliers from signal to load
@@ -262,75 +258,82 @@ class MastDataset(Dataset):
             else:
                 source_signals[source] = [signal]
 
-        # First, iterate over each source to get source store.
-        # Then, iterate over each signal in source group.
-        for source in source_signals:
-            source_store = self.sig.get_source_profiles(data_origin=store, source_name=source)
+        # Open the shot once as an xarray.DataTree, then read each source group from it.
+        with self.sig.store_manager.open_shot_group(
+            data_origin=ShotInfo(shot_id=self.shots_list[idx], local=self.local), verbose=self.verbose
+        ) as shot_tree:
+            # First, iterate over each source to get source store.
+            # Then, iterate over each signal in source group.
+            for source in source_signals:
+                source_store = self.sig.get_source_profiles(data_origin=shot_tree, source_name=source)
 
-            load_signals = True
-            mask_efit_rating = None
-            if (source_store is not None) and (source == "equilibrium") and self.remove_bad_efit_rating:
-                if "ip_rating" in list(source_store.data_vars):
-                    mask_efit_rating = (  # noqa - Ignore attribute warning
-                        self.sig.get_signal_profile(
-                            data_origin=source_store, signal_name="ip_rating", verbose=self.verbose
-                        )
-                        == 0
-                    ).values
-
-                else:
-                    if self.verbose:
-                        print(f"ip_rating not available for shot {self.get_shot_id(idx)}.")
-                    load_signals = False
-
-            for signal in source_signals[source]:
-                shot_vals = None
-                shot_time = None
-
-                if (source_store is not None) and load_signals:
-                    signal_profile = self.sig.get_signal_profile(
-                        data_origin=source_store, signal_name=signal, verbose=self.verbose
-                    )
-
-                    if signal_profile is not None:
-                        try:
-                            shot_time, _ = self.sig.get_signal_times_and_time_type(
-                                signal_name=signal, data_origin=source_store, source_name=source, verbose=self.verbose
+                load_signals = True
+                mask_efit_rating = None
+                if (source_store is not None) and (source == "equilibrium") and self.remove_bad_efit_rating:
+                    if "ip_rating" in list(source_store.data_vars):
+                        mask_efit_rating = (  # noqa - Ignore attribute warning
+                            self.sig.get_signal_profile(
+                                data_origin=source_store, signal_name="ip_rating", verbose=self.verbose
                             )
+                            == 0
+                        ).values
 
-                        except Exception as e:
-                            print(f"Error while getting time for shot {self.shots_list[idx]}: {e}.")
-                            shot_time = None
-
-                        try:
-                            signal_profile_vals = signal_profile.values  # noqa - Ignore missing attribute warning
-                            shot_vals = (
-                                np.expand_dims(signal_profile_vals, axis=0)
-                                if signal_profile_vals.ndim == 1
-                                else signal_profile_vals
-                            )
-
-                            if mask_efit_rating is not None:
-                                # Expand mask to match shot_vals dimensions
-                                expand_shape = (1,) * (shot_vals.ndim - 1) + (mask_efit_rating.shape[0],)  # noqa
-                                mask_expanded = mask_efit_rating.reshape(expand_shape)  # noqa - Ignore missing att
-                                # Apply mask
-                                shot_vals = np.where(mask_expanded, np.nan, shot_vals)
-
-                        except AttributeError:
-                            shot_vals = None
-
-                # Apply variable-level transforms only if we have both time and values
-                if shot_vals is not None and shot_time is not None:
-                    if self.signal_level_transform_map is not None:
-                        shot[f"{source}-{signal}"] = self.signal_level_transform_map[f"{source}-{signal}"](
-                            {"time": shot_time, "values": shot_vals}
-                        )
                     else:
-                        shot[f"{source}-{signal}"] = {"time": shot_time, "values": shot_vals}
-                else:
-                    # Keep missing signals as {"time": np.array([]), "values": np.array([])}
-                    shot[f"{source}-{signal}"] = {"time": np.array([]), "values": np.array([])}
+                        if self.verbose:
+                            print(f"ip_rating not available for shot {self.get_shot_id(idx)}.")
+                        load_signals = False
+
+                for signal in source_signals[source]:
+                    shot_vals = None
+                    shot_time = None
+
+                    if (source_store is not None) and load_signals:
+                        signal_profile = self.sig.get_signal_profile(
+                            data_origin=source_store, signal_name=signal, verbose=self.verbose
+                        )
+
+                        if signal_profile is not None:
+                            try:
+                                shot_time, _ = self.sig.get_signal_times_and_time_type(
+                                    signal_name=signal,
+                                    data_origin=source_store,
+                                    source_name=source,
+                                    verbose=self.verbose,
+                                )
+
+                            except Exception as e:
+                                print(f"Error while getting time for shot {self.shots_list[idx]}: {e}.")
+                                shot_time = None
+
+                            try:
+                                signal_profile_vals = signal_profile.values  # noqa - Ignore missing attribute warning
+                                shot_vals = (
+                                    np.expand_dims(signal_profile_vals, axis=0)
+                                    if signal_profile_vals.ndim == 1
+                                    else signal_profile_vals
+                                )
+
+                                if mask_efit_rating is not None:
+                                    # Expand mask to match shot_vals dimensions
+                                    expand_shape = (1,) * (shot_vals.ndim - 1) + (mask_efit_rating.shape[0],)  # noqa
+                                    mask_expanded = mask_efit_rating.reshape(expand_shape)  # noqa - Ignore missing att
+                                    # Apply mask
+                                    shot_vals = np.where(mask_expanded, np.nan, shot_vals)
+
+                            except AttributeError:
+                                shot_vals = None
+
+                    # Apply variable-level transforms only if we have both time and values
+                    if shot_vals is not None and shot_time is not None:
+                        if self.signal_level_transform_map is not None:
+                            shot[f"{source}-{signal}"] = self.signal_level_transform_map[f"{source}-{signal}"](
+                                {"time": shot_time, "values": shot_vals}
+                            )
+                        else:
+                            shot[f"{source}-{signal}"] = {"time": shot_time, "values": shot_vals}
+                    else:
+                        # Keep missing signals as {"time": np.array([]), "values": np.array([])}
+                        shot[f"{source}-{signal}"] = {"time": np.array([]), "values": np.array([])}
 
         return shot
 
