@@ -4,22 +4,29 @@ Python style reference: https://google.github.io/styleguide/pyguide.html
 """
 
 import os.path
+import re
 import numpy as np
-import zarr
-import zarr.storage
+import xarray as xr
 import fsspec
 import s3fs
 import pandas as pd
 import warnings
 from typing import Union, Any
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 import logging
 from pprint import pprint
 import time
 from posixpath import join as posix_join
 from os.path import join as os_join
 
-from MAST_tools.utils.data_utils import ShotInfo, BaseDataSourceType, ZarrStoreType, ZarrFSStoreType, ShotInfoType
+from MAST_tools.utils.data_utils import (
+    ShotInfo,
+    BaseDataSourceType,
+    ShotInfoType,
+    DataFormatType,
+    DataSourceHandleType,
+)
 from MAST_tools.utils.general_utils import get_random_string, warning_print
 from MAST_tools.utils.path_utils import DEFAULT_SIGNAL_AVAILABILITY_FILE
 
@@ -35,9 +42,42 @@ DEFAULT_BASE_FSSPEC_PROTOCOL = "simplecache"
 DEFAULT_TARGET_FSSPEC_PROTOCOL = "s3"
 DEFAULT_S3_ENDPOINT_URL = "https://s3.echo.stfc.ac.uk"
 DEFAULT_S3_MAST_DATASET_PATH = "/mast/tokamark/v1"
-DEFAULT_BASE_LOCAL_ZARR_PATH = "/mast/tokamark/v1"  # <- Replace default value if different installation dir is used.
+DEFAULT_BASE_LOCAL_DATA_PATH = "/mast/tokamark/v1"  # <- Replace default value if different installation dir is used.
+
+DEFAULT_BASE_LOCAL_ZARR_PATH = DEFAULT_BASE_LOCAL_DATA_PATH
+"""Deprecated alias for `DEFAULT_BASE_LOCAL_DATA_PATH`, kept for backwards compatibility."""
 
 DEFAULT_LOCAL_FLAG_VALUE = False
+
+DEFAULT_DATA_FORMAT: DataFormatType = "zarr"
+SUPPORTED_DATA_FORMATS: tuple[DataFormatType, ...] = ("zarr", "netcdf")
+FORMAT_FILE_EXTENSIONS: dict[DataFormatType, str] = {"zarr": ".zarr", "netcdf": ".nc"}
+NETCDF_ENGINE = "h5netcdf"
+FORMAT_ENGINES: dict[DataFormatType, str] = {"zarr": "zarr", "netcdf": NETCDF_ENGINE}
+"""`xarray` engine used to read each supported data format."""
+
+_REMOTE_URI_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def is_remote_uri(handle: Any) -> bool:
+    """
+    Check whether a data source handle is a remote URI (e.g. "s3://mast/tokamark/v1/30471.zarr").
+
+    Parameters
+    ----------
+    handle : Any
+        Data source handle to be checked. Non-str handles (local paths as `os.PathLike`, file-like objects) are
+        never considered remote URIs.
+
+    Returns
+    -------
+    bool
+        True if `handle` is a str with a URI scheme prefix, False otherwise.
+
+    """
+
+    return isinstance(handle, str) and bool(_REMOTE_URI_PATTERN.match(handle))
 
 
 # ======================================================================================================================
@@ -47,6 +87,8 @@ class MASTStorageManager:
 
     Attributes
     ----------
+    data_format : DataFormatType
+        On-disk/S3 data format to load, either "zarr" or "netcdf". Both are read via `xarray`.
     base_fsspec_protocol : str
         Base protocol used by 'fsspec'.
     target_fsspec_protocol : str
@@ -55,8 +97,8 @@ class MASTStorageManager:
         Endpoint of the cloud S3 bucket used for remote data pulling.
     s3_mast_dataset_path : str
         Path for the target MAST dataset within the configured S3 bucket.
-    base_local_zarr_path : str | None
-        Local root path used for local data pulling in Zarr format.
+    base_local_data_path : str | None
+        Local root path used for local data pulling.
     fs_local_fsspec : fsspec.implementations.local.LocalFileSystem
         A LocalFileSystem instance.
     fs_remote_fsspec : Any
@@ -68,14 +110,16 @@ class MASTStorageManager:
 
     Methods
     -------
-    _validate_base_local_zarr_path()
-        Check if local path for Zarr database is set, raising SystemError if not.
-    _check_local_zarr_database()
-        Run access checks for a potential local Zarr database.
+    _validate_base_local_data_path()
+        Check if local path for the data database is set, raising SystemError if not.
+    _check_local_data_database()
+        Run access checks for a potential local data database.
     _is_digit(item)
         Check if provided item is of type digit.
-    _get_store_from_data_origin(data_origin)
-        Auxiliary function to get Zarr store instance from a given data origin.
+    _shot_uri(shot_id, local)
+        Build the local path or remote URI for a given shot.
+    _open_kwargs(handle)
+        Build the `xarray` open keyword arguments for a given data source handle.
     _parse_shot_info_dict(shot_info)
         Parse dictionary with shot information.
     _check_shot_id(shot_id)
@@ -97,9 +141,11 @@ class MASTStorageManager:
     get_all_signals(shot_ids, local, verbose)
         Return a dictionary with all available signals per shot ID.
     make_shot_store(shot_info, verbose)
-        Make a Zarr store (either LocalStore or FsspecStore) for a given target shot.
+        Make a data source handle (local path or remote URI) for a given target shot.
     make_shot_group(data_origin, verbose)
-        Make a shot group from data origin (either a Zarr store or shot info).
+        Make an `xarray.DataTree` for a shot from data origin (either a data source handle or shot info).
+    open_shot_group(data_origin, verbose)
+        Context manager around `make_shot_group()`, closing the tree on exit if it was opened by this call.
 
     """
 
@@ -110,13 +156,20 @@ class MASTStorageManager:
         target_fsspec_protocol: str = DEFAULT_TARGET_FSSPEC_PROTOCOL,
         s3_endpoint_url: str = DEFAULT_S3_ENDPOINT_URL,
         s3_mast_dataset_path: str = DEFAULT_S3_MAST_DATASET_PATH,
-        base_local_zarr_path: str | None = DEFAULT_BASE_LOCAL_ZARR_PATH,
+        base_local_data_path: str | None = DEFAULT_BASE_LOCAL_DATA_PATH,
+        data_format: DataFormatType = DEFAULT_DATA_FORMAT,
+        base_local_zarr_path: str | None = None,
     ) -> None:
         """
         Initialize class attributes.
 
         Parameters
         ----------
+        data_format : DataFormatType
+            On-disk/S3 data format to load, either "zarr" or "netcdf". Both are loaded via xarray; netCDF reads use
+            the `h5netcdf` engine, which supports both local paths and remote file-like objects (unlike `netCDF4`,
+            which cannot reliably read from S3 file-like objects).
+            Default: MAST_tools.utils.store_utils.DEFAULT_DATA_FORMAT.
         base_fsspec_protocol: str
             Base protocol used by 'fsspec'. Some supported protocols include:
             `blockcache`:
@@ -142,9 +195,13 @@ class MASTStorageManager:
         s3_mast_dataset_path : str
             Path for the target MAST dataset within the configured S3 bucket.
             Default: MAST_tools.utils.store_utils.DEFAULT_S3_MAST_DATASET_PATH.
+        base_local_data_path : str | None
+            Local root path used for local data pulling.
+            Default: MAST_tools.utils.store_utils.DEFAULT_BASE_LOCAL_DATA_PATH.
         base_local_zarr_path : str | None
-            Local root path used for local data pulling in Zarr format.
-            Default: MAST_tools.utils.store_utils.BASE_LOCAL_ZARR_PATH.
+            Deprecated alias for `base_local_data_path`. If set, it takes precedence and a DeprecationWarning is
+            emitted.
+            Optional. Default: None.
 
         Returns
         -------
@@ -153,17 +210,31 @@ class MASTStorageManager:
         Raises
         ------
         FileNotFoundError
-            If provided `base_local_zarr_path` directory is not found.
+            If provided `base_local_data_path` directory is not found.
+        ValueError
+            If provided `data_format` is not one of `SUPPORTED_DATA_FORMATS`.
 
         """
+
+        if data_format not in SUPPORTED_DATA_FORMATS:
+            raise ValueError(f"Invalid `data_format` '{data_format}': it must be one of {SUPPORTED_DATA_FORMATS}.")
+        self.data_format = data_format
+
+        if base_local_zarr_path is not None:
+            warnings.warn(
+                "Parameter `base_local_zarr_path` is deprecated: use `base_local_data_path` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            base_local_data_path = base_local_zarr_path
 
         self.base_fsspec_protocol = base_fsspec_protocol
         self.target_fsspec_protocol = target_fsspec_protocol
         self.s3_endpoint_url = s3_endpoint_url
         self.s3_mast_dataset_path = s3_mast_dataset_path
-        self.base_local_zarr_path = base_local_zarr_path
+        self.base_local_data_path = base_local_data_path
 
-        self._check_local_zarr_database()
+        self._check_local_data_database()
         self.fs_local_fsspec = fsspec.filesystem("file")
         self.fs_remote_fsspec = self._create_fs_remote(library="fsspec")
         self.fs_remote_s3fs = self._create_fs_remote(library="s3fs")
@@ -171,47 +242,68 @@ class MASTStorageManager:
         self.store_manager_id = f"store_manager_{get_random_string(4)}"
 
     # ------------------------------------------------------------------------------------------------------------------
-    def _validate_base_local_zarr_path(self):
-        """Check if local path for Zarr database is set, raising SystemError if not."""
-        if self.base_local_zarr_path is None:
+    @property
+    def engine(self) -> str:
+        """`xarray` engine matching the configured data format."""
+
+        return FORMAT_ENGINES[self.data_format]
+
+    # ------------------------------------------------------------------------------------------------------------------
+    @property
+    def base_local_zarr_path(self) -> str | None:
+        """Deprecated alias for `self.base_local_data_path`, kept for backwards compatibility."""
+
+        return self.base_local_data_path
+
+    # ------------------------------------------------------------------------------------------------------------------
+    def _validate_base_local_data_path(self):
+        """Check if local path for the data database is set, raising SystemError if not."""
+        if self.base_local_data_path is None:
             raise SystemError(
-                "No path for local Zarr database was set during the creation of the MASTStorageManager instance."
+                "No path for a local data database was set during the creation of the MASTStorageManager instance."
             )
 
     # ------------------------------------------------------------------------------------------------------------------
-    def _check_local_zarr_database(self):
-        """Run access checks for a potential local Zarr database."""
+    def _check_local_data_database(self):
+        """Run access checks for a potential local data database (Zarr or netCDF, per `self.data_format`)."""
+
+        file_extension = FORMAT_FILE_EXTENSIONS[self.data_format]
+        format_label = self.data_format.capitalize()
 
         warning_message = ""
-        if self.base_local_zarr_path is None:
+        if self.base_local_data_path is None:
             warning_message = (
-                "No path for local Zarr database was set during the creation of the MASTStorageManager instance."
+                f"No path for local {format_label} database was set during the creation of the MASTStorageManager "
+                f"instance."
             )
         else:
             # Warn about inexistent path
-            if not os.path.isdir(self.base_local_zarr_path):
+            if not os.path.isdir(self.base_local_data_path):
                 warning_message = (
-                    f"The path `{self.base_local_zarr_path}` for a local Zarr database, which was set during the "
-                    f"creation of the MASTStorageManager instance, does not correspond to a valid local directory."
+                    f"The path `{self.base_local_data_path}` for a local {format_label} database, which was set "
+                    f"during the creation of the MASTStorageManager instance, does not correspond to a valid local "
+                    f"directory."
                 )
             else:
-                zarr_files = [file_ for file_ in os.listdir(self.base_local_zarr_path) if file_.endswith(".zarr")]
-                if len(zarr_files):
+                data_files = [
+                    file_ for file_ in os.listdir(self.base_local_data_path) if file_.endswith(file_extension)
+                ]
+                if len(data_files):
                     print(
-                        f"[INFO] Local Zarr database identified under `{self.base_local_zarr_path}` with "
-                        f"{len(zarr_files)} Zarr files in it."
+                        f"[INFO] Local {format_label} database identified under `{self.base_local_data_path}` with "
+                        f"{len(data_files)} {format_label} files in it."
                     )
                 else:
-                    # Warn about no Zarr files found
+                    # Warn about no data files found
                     warning_message = (
-                        f"No Zarr files found under the path `{self.base_local_zarr_path}`, which was set during the "
-                        f"creation of the MASTStorageManager instance."
+                        f"No {format_label} files found under the path `{self.base_local_data_path}`, which was set "
+                        f"during the creation of the MASTStorageManager instance."
                     )
         if warning_message:
             additional_warning = (
                 f"This will cause local pipelines to fail. To avoid this, either provide a valid installation path for "
-                f"a local Zarr database, or use default MASTStorageManager settings and install the database under "
-                f"the default directory `{DEFAULT_BASE_LOCAL_ZARR_PATH}`."
+                f"a local {format_label} database, or use default MASTStorageManager settings and install the "
+                f"database under the default directory `{DEFAULT_BASE_LOCAL_DATA_PATH}`."
             )
             warning_print(f"\n{warning_message} {additional_warning}\n")
 
@@ -243,40 +335,67 @@ class MASTStorageManager:
         return is_digit
 
     # ------------------------------------------------------------------------------------------------------------------
-    def _get_store_from_data_origin(
-        self,
-        data_origin: BaseDataSourceType,
-    ) -> ZarrFSStoreType:
+    @staticmethod
+    def _is_file_like(item: Any) -> bool:
+        """Duck-type check for a file-like object (e.g. an `s3fs`/`fsspec` remote file handle)."""
+
+        return hasattr(item, "read") and hasattr(item, "seek")
+
+    # ------------------------------------------------------------------------------------------------------------------
+    def _shot_uri(self, shot_id: Any, local: bool) -> str:
         """
-        Auxiliary function to get Zarr store instance from a given data origin.
+        Build the data source handle (local path or remote URI) for a given shot, per `self.data_format`.
 
         Parameters
         ----------
-        data_origin : BaseDataSourceType
-            Origin of data for group creation. It can be a Mapping (dictionary) with shot information (as in the class
-            method `self.make_shot_store()`) or a Zarr store (ZarrStoreType instance).
+        shot_id : Any
+            Target shot ID, already validated via `self._check_shot_id()`.
+        local : bool
+            If True, a local path under `self.base_local_data_path` is built, otherwise a remote URI under
+            `self.s3_mast_dataset_path` is built.
 
         Returns
         -------
-        ZarrFSStoreType
-            Instance of Zarr store.
-
-        Raises
-        ------
-        TypeError
-            If `data_origin` is not of type `BaseDataSourceType`.
+        str
+            Local file path (e.g. "/mast/tokamark/v1/30471.zarr"), or remote URI (e.g.
+            "s3://mast/tokamark/v1/30471.zarr").
 
         """
 
-        self.check_data_origin(data_origin=data_origin)
-        if isinstance(data_origin, dict):
-            # data_origin is a dict with shot info
-            return self.make_shot_store(shot_info=data_origin)  # noqa - Ignore expected type warning
-        elif isinstance(data_origin, ZarrFSStoreType):
-            # data_origin is a Zarr store
-            return data_origin
-        else:
-            raise TypeError("Invalid type for `data_origin`: it must be of type BaseDataSourceType.")
+        file_extension = FORMAT_FILE_EXTENSIONS[self.data_format]
+        file_name = f"{shot_id}{file_extension}"
+
+        if local:
+            self._validate_base_local_data_path()
+            return os_join(str(self.base_local_data_path), file_name)
+
+        remote_path = posix_join(self.s3_mast_dataset_path, file_name)
+
+        return f"{self.target_fsspec_protocol}://{remote_path.lstrip('/')}"
+
+    # ------------------------------------------------------------------------------------------------------------------
+    def _open_kwargs(self, handle: DataSourceHandleType) -> dict[str, Any]:
+        """
+        Build the keyword arguments used to open a data source handle via `xarray`.
+
+        Parameters
+        ----------
+        handle : DataSourceHandleType
+            Data source handle (local path, remote URI, or file-like object).
+
+        Returns
+        -------
+        dict[str, Any]
+            Keyword arguments for `xarray.open_datatree()`/`xarray.open_dataset()`, i.e., the engine matching
+            `self.data_format` plus, for remote URIs only, the S3 storage options.
+
+        """
+
+        open_kwargs: dict[str, Any] = {"engine": self.engine, "create_default_indexes": False}
+        if is_remote_uri(handle):
+            open_kwargs["storage_options"] = {"anon": True, "endpoint_url": self.s3_endpoint_url}
+
+        return open_kwargs
 
     # ------------------------------------------------------------------------------------------------------------------
     def _parse_shot_info_dict(
@@ -334,7 +453,9 @@ class MASTStorageManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Object expected to define data origin for Zarr group/store creation, either Mapping or ZarrStoreType.
+            Object expected to define data origin for tree/handle creation: a Mapping (shot info), a data source
+            handle (local path str, `os.PathLike`, remote URI, or file-like object), or an already opened
+            `xarray.DataTree`.
 
         Returns
         -------
@@ -343,13 +464,19 @@ class MASTStorageManager:
         Raises
         ------
         TypeError
-            If parameter data_origin is not dict or `ZarrStoreType` (i.e., either `zarr.storage.FsspecStore` or
-            `zarr.storage.LocalStore`).
+            If parameter `data_origin` is not a dict, a str/`os.PathLike` path or URI, an `xarray.DataTree`, or a
+            file-like object.
 
         """
 
-        if not isinstance(data_origin, Union[dict, ZarrStoreType]):
-            raise TypeError("Invalid parameter `data_origin`: it must be of type dict or ZarrStoreType.")
+        is_valid = isinstance(data_origin, (dict, str, os.PathLike, xr.DataTree)) or MASTStorageManager._is_file_like(
+            data_origin
+        )
+        if not is_valid:
+            raise TypeError(
+                "Invalid parameter `data_origin`: it must be of type dict, str, os.PathLike, xarray.DataTree, or "
+                "file-like."
+            )
 
     # ------------------------------------------------------------------------------------------------------------------
     def _check_shot_id(self, shot_id: Any) -> None:
@@ -501,15 +628,18 @@ class MASTStorageManager:
 
         # FSSpec pipeline
         if local:
-            self._validate_base_local_zarr_path()
-            all_filenames = self._read_fsspec_listdir(path=str(self.base_local_zarr_path), local=True)
+            self._validate_base_local_data_path()
+            all_filenames = self._read_fsspec_listdir(path=str(self.base_local_data_path), local=True)
         else:
             all_filenames = [
                 item["Key"] for item in self._read_fsspec_listdir(path=self.s3_mast_dataset_path, local=False)
             ]
 
+        file_extension = FORMAT_FILE_EXTENSIONS[self.data_format]
         raw_shot_ids = [
-            filename.split("/")[-1].split(".zarr")[0] for filename in all_filenames if filename.endswith(".zarr")
+            filename.split("/")[-1].split(file_extension)[0]
+            for filename in all_filenames
+            if filename.endswith(file_extension)
         ]
 
         shot_ids = [int(raw_shot_id) for raw_shot_id in raw_shot_ids if self._is_digit(raw_shot_id)]
@@ -598,8 +728,8 @@ class MASTStorageManager:
 
         source_info = {}
         for id_ in shot_ids:
-            group = self.make_shot_group(data_origin=ShotInfo(shot_id=id_, local=local))
-            source_info[id_] = list(group.keys())
+            with self.open_shot_group(data_origin=ShotInfo(shot_id=id_, local=local)) as shot_tree:
+                source_info[id_] = list(shot_tree.children.keys())
 
         return source_info
 
@@ -638,31 +768,24 @@ class MASTStorageManager:
         # FSSpec pipeline
         signal_info = {}
         for shot_id in shot_ids:
-            group = self.make_shot_group(data_origin=ShotInfo(shot_id=shot_id, local=local))
-
-            group_members = group.members(1)
-            for item in group_members:
-                member = None
-                try:
-                    group, member = item[0].split("/")
-                    signal_info[shot_id].append(f"{group}-{member}")
-                except KeyError:
-                    signal_info[shot_id] = [f"{group}-{member}"]
-                except ValueError:
-                    if verbose:
-                        print(f"Skipped item: {item[0]}")
+            with self.open_shot_group(data_origin=ShotInfo(shot_id=shot_id, local=local), verbose=verbose) as shot_tree:
+                signal_info[shot_id] = self.get_all_signals_in_group(group=shot_tree)
 
         return signal_info
 
     # ------------------------------------------------------------------------------------------------------------------
-    def make_shot_store(self, shot_info: ShotInfoType, verbose: bool = False) -> ZarrStoreType:
+    def make_shot_store(self, shot_info: ShotInfoType, verbose: bool = False) -> DataSourceHandleType:
         """
-        Make a Zarr store (either LocalStore or FsspecStore) for a given target shot.
+        Make a data source handle for a given target shot, per `self.data_format`.
+
+        The handle is a local file path (e.g. "/mast/tokamark/v1/30471.zarr") or a remote URI (e.g.
+        "s3://mast/tokamark/v1/30471.zarr"), for both supported data formats. It is resolved into an
+        `xarray.DataTree` by `self.make_shot_group()`, using the engine matching `self.data_format`.
 
         Parameters
         ----------
         shot_info : ShotInfoType
-            Dictionary with shot information required for store creation, with valid keys and types as defined in
+            Dictionary with shot information required for handle creation, with valid keys and types as defined in
             `MAST_tools.data_models.ShotInfo`. Keys and values are validated via `self._parse_shot_info_dict()`,
             where default values for non-required keys are also set.
 
@@ -672,97 +795,106 @@ class MASTStorageManager:
 
         Returns
         -------
-        ZarrStoreType
-            Either a zarr.storage.LocalStore instance or a zarr.storage.FsspecStore instance.
+        DataSourceHandleType
+            Local file path, or remote URI, for the target shot.
 
         """
 
         parsed_shot_info = self._parse_shot_info_dict(shot_info=shot_info)
-        if parsed_shot_info["local"]:
-            self._validate_base_local_zarr_path()
-            zarr_file_path = os_join(str(self.base_local_zarr_path), f"{parsed_shot_info['shot_id']}.zarr")
-            store = zarr.storage.LocalStore(root=zarr_file_path)
-
-        else:
-            zarr_file_path = posix_join(self.s3_mast_dataset_path, f"{parsed_shot_info['shot_id']}.zarr")
-            store = zarr.storage.FsspecStore(fs=self.fs_remote_s3fs, read_only=True, path=zarr_file_path)
+        store = self._shot_uri(shot_id=parsed_shot_info["shot_id"], local=parsed_shot_info["local"])
 
         if verbose:
-            store_type = "LocalStore" if parsed_shot_info["local"] else "FsspecStore"
-            print(f"{store_type} store for shot {parsed_shot_info['shot_id']} created.")
+            location = "local" if parsed_shot_info["local"] else "remote (S3)"
+            print(f"{self.data_format} handle ({location}) for shot {parsed_shot_info['shot_id']}: {store}")
 
         return store
 
     # ------------------------------------------------------------------------------------------------------------------
-    def make_shot_group(self, data_origin: BaseDataSourceType, verbose: bool = False) -> zarr.Group:
+    def make_shot_group(self, data_origin: BaseDataSourceType, verbose: bool = False) -> xr.DataTree:
         """
-        Make a shot group from data origin (either a Zarr store or shot info).
+        Make an `xarray.DataTree` for a shot from data origin (either a data source handle or shot info).
+
+        The same code path serves both supported data formats: only the `xarray` engine (and, for remote URIs, the
+        storage options) differ, as resolved by `self._open_kwargs()`.
 
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for group creation. It can be a Mapping (dictionary) with shot information (as in the class
-            method `self.make_shot_store()`) or a Zarr store (ZarrStoreType instance).
+            Origin of data for tree creation. It can be a Mapping (dictionary) with shot information (as in the class
+            method `self.make_shot_store()`), a data source handle (DataSourceHandleType instance), or an already
+            opened `xarray.DataTree` (in which case it is returned unchanged, making this method idempotent).
         verbose : bool
             If True, verbose mode is activated.
             Default: False.
 
         Returns
         -------
-        zarr.Group
-            Zarr group created from data origin.
+        xarray.DataTree
+            DataTree for the target shot, with one child node per source group.
 
         """
 
         self.check_data_origin(data_origin=data_origin)
-        if isinstance(data_origin, ZarrStoreType):
-            # Create group from store
-            group = zarr.open_group(store=data_origin, mode="r")  # noqa - Ignore expected type warning
-            if verbose:
-                print(f"Group for store with path {group.path} created.")
+
+        if isinstance(data_origin, xr.DataTree):
+            # Already an opened tree: nothing to do.
+            return data_origin
+
+        handle: DataSourceHandleType
+        if isinstance(data_origin, Mapping):
+            # Create handle from shot info mapping. REMARK: `xarray.DataTree` is itself a Mapping, hence this check
+            # must stay after the early return above.
+            handle = self.make_shot_store(shot_info=data_origin, verbose=verbose)
         else:
-            # Create group from shot info dictionary
+            # Use the given data source handle as-is
+            handle = data_origin
 
-            parsed_shot_info = self._parse_shot_info_dict(shot_info=data_origin)  # noqa - Ignore expected type warning
-            if parsed_shot_info["local"]:
-                self._validate_base_local_zarr_path()
-
-                # Create group by implicitly creating a writable LocalStore
-                local_path = os_join(str(self.base_local_zarr_path), f"{parsed_shot_info['shot_id']}.zarr")
-
-                group = zarr.open_group(store=local_path, mode="r")
-                # Source: https://zarr.readthedocs.io/en/latest/user-guide/storage.html#implicit-store-creation
-            else:
-                # Create group by implicitly creating a read-only FsspecStore
-
-                remote_shot_path = posix_join(self.s3_mast_dataset_path, f"{parsed_shot_info['shot_id']}.zarr")
-
-                store_path = f"{self.target_fsspec_protocol}:/{remote_shot_path}"
-                print(f"store_path: {store_path}")
-                group = zarr.open_group(
-                    store=store_path, mode="r", storage_options={"anon": True, "endpoint_url": self.s3_endpoint_url}
-                )
-                # Source: https://zarr.readthedocs.io/en/latest/user-guide/storage.html#implicit-store-creation
-
-            if verbose:
-                print(f"Group for shot {parsed_shot_info['shot_id']} created.")
+        shot_tree = xr.open_datatree(handle, **self._open_kwargs(handle=handle))
 
         if verbose:
-            print("Group tree:\n")
-            print(group.tree())
+            print(f"DataTree created for `{handle}` with groups: {shot_tree.groups}")
 
-        return group
+        return shot_tree
+
+    # ------------------------------------------------------------------------------------------------------------------
+    @contextmanager
+    def open_shot_group(self, data_origin: BaseDataSourceType, verbose: bool = False) -> Iterator[xr.DataTree]:
+        """
+        Context manager wrapping `self.make_shot_group()`, closing the tree on exit only if it was opened here.
+
+        Parameters
+        ----------
+        data_origin : BaseDataSourceType
+            Origin of data for tree creation, as in `self.make_shot_group()`. If an already opened `xarray.DataTree`
+            is provided, it is yielded unchanged and left open, since its lifetime belongs to the caller.
+        verbose : bool
+            If True, verbose mode is activated.
+            Default: False.
+
+        Yields
+        ------
+        xarray.DataTree
+            DataTree for the target shot.
+
+        """
+
+        shot_tree = self.make_shot_group(data_origin=data_origin, verbose=verbose)
+        try:
+            yield shot_tree
+        finally:
+            if shot_tree is not data_origin:
+                shot_tree.close()
 
     # ------------------------------------------------------------------------------------------------------------------
     @staticmethod
-    def get_all_signals_in_group(group: zarr.Group) -> list[str]:
+    def get_all_signals_in_group(group: xr.DataTree) -> list[str]:
         """
         Get list of all signals in a given group.
 
         Parameters
         ----------
-        group : zarr.Group
-            Zarr group to be inspected for signals.
+        group : xarray.DataTree
+            DataTree to be inspected for signals.
 
         Returns
         -------
@@ -771,21 +903,25 @@ class MASTStorageManager:
 
         """
 
-        full_metadata_dict = group.metadata.to_dict()
-        all_metadata_keys = list(full_metadata_dict["consolidated_metadata"]["metadata"].keys())
-        found_signals = [kk.replace("/", "-") for kk in all_metadata_keys if "/" in kk]
+        found_signals = []
+        for group_path in group.groups:
+            if group_path == "/":
+                continue
+            group_name = group_path.strip("/").split("/")[-1]
+            node_dataset = group[group_path].dataset
+            found_signals.extend(f"{group_name}-{member}" for member in node_dataset.data_vars)
 
         return found_signals
 
     # ------------------------------------------------------------------------------------------------------------------
-    def get_all_signals_in_store(self, store: ZarrStoreType) -> list[str]:
+    def get_all_signals_in_store(self, store: DataSourceHandleType) -> list[str]:
         """
         Get list of all signals in a given group.
 
         Parameters
         ----------
-        store : ZarrStoreType
-            Zarr store to be inspected for signals.
+        store : DataSourceHandleType
+            Data source handle to be inspected for signals.
 
         Returns
         -------
@@ -794,16 +930,17 @@ class MASTStorageManager:
 
         """
 
-        found_signals = self.get_all_signals_in_group(group=self.make_shot_group(data_origin=store))
+        with self.open_shot_group(data_origin=store) as shot_tree:
+            found_signals = self.get_all_signals_in_group(group=shot_tree)
 
         return found_signals
 
     # ------------------------------------------------------------------------------------------------------------------
-    def are_signals_in_group(self, group: zarr.Group, signals: list[str]) -> dict[str, bool]:
+    def are_signals_in_group(self, group: xr.DataTree, signals: list[str]) -> dict[str, bool]:
         """
         Evaluate if a given signal is in a target group.
 
-        group :  zarr.Group
+        group : xarray.DataTree
             Target group.
         signals: list[str]
             List of signals to be searched within the target group. It expects the format [<source>-<signal>].
@@ -821,11 +958,11 @@ class MASTStorageManager:
         return check_results
 
     # ------------------------------------------------------------------------------------------------------------------
-    def are_signals_in_store(self, store: ZarrStoreType, signals: list[str]) -> dict[str, bool]:
+    def are_signals_in_store(self, store: DataSourceHandleType, signals: list[str]) -> dict[str, bool]:
         """
         Evaluate if a given signal is in a target store.
 
-        store : ZarrStoreType
+        store : DataSourceHandleType
             Target store.
         signals: list[str]
             List of signals to be searched within the target store. It expects the format [<source>-<signal>].
@@ -837,7 +974,8 @@ class MASTStorageManager:
 
         """
 
-        return self.are_signals_in_group(group=self.make_shot_group(data_origin=store), signals=signals)
+        with self.open_shot_group(data_origin=store) as shot_tree:
+            return self.are_signals_in_group(group=shot_tree, signals=signals)
 
     # ------------------------------------------------------------------------------------------------------------------
 
@@ -871,7 +1009,7 @@ def tests() -> None:
         target_fsspec_protocol="s3",
         s3_endpoint_url="https://s3.echo.stfc.ac.uk",
         s3_mast_dataset_path="/mast/tokamark/v1",
-        base_local_zarr_path="/mast/tokamark/v1",
+        base_local_data_path="/mast/tokamark/v1",
     )
 
     TESTS_TO_RUN = {  # noqa - Ignore lowercase warning
@@ -883,6 +1021,7 @@ def tests() -> None:
         "check_signal_in_store": True,
         "get_all_signals_in_store": True,
         "check_signal_availability": False,
+        "storage_fixture": False,  # -> See `tests/test_storage.py` for fixture generation.
     }
 
     # ..................................................................................................................
@@ -921,22 +1060,16 @@ def tests() -> None:
 
     if TESTS_TO_RUN["make_group_from_store"]:
         store_ = store_manager.make_shot_store(shot_info=shot_info)
-        group_from_store = store_manager.make_shot_group(data_origin=store_)
 
-        # Print group metadata:
-        # print(f"group_from_store.metadata.to_dict() (group from store): {group_from_store.metadata.to_dict()}")
-
-        # Print group tree:
-        print(f"group_from_store.tree() (group from store): {group_from_store.tree()}\n")
+        with store_manager.open_shot_group(data_origin=store_) as group_from_store:
+            print(f"group_from_store.groups (group from store): {group_from_store.groups}\n")
 
     # ..................................................................................................................
     # Make group for a given shot directly from shot_info
 
     if TESTS_TO_RUN["make_group_from_shot_info"]:
-        group_from_shot_id = store_manager.make_shot_group(data_origin=shot_info)
-
-        # Print group tree:
-        print(f"group_from_shot_id.tree() (group from shot ID): {group_from_shot_id.tree()}\n")
+        with store_manager.open_shot_group(data_origin=shot_info) as group_from_shot_id:
+            print(f"group_from_shot_id.groups (group from shot ID): {group_from_shot_id.groups}\n")
 
     # ..................................................................................................................
     # Get all the signals available for a given store
@@ -980,6 +1113,28 @@ def tests() -> None:
 
         print(f"\nfiltered_ids ({len(list(filtered_ids))} shots):")
         pprint(filtered_ids)
+
+    # ..................................................................................................................
+    # Run against the synthetic fixtures generated by `tests/test_storage.py`, for both data formats.
+
+    if TESTS_TO_RUN["storage_fixture"]:
+        import tempfile
+        from pathlib import Path
+
+        from tests.test_storage import FIXTURE_SHOT_ID, _write_fixture
+
+        with tempfile.TemporaryDirectory() as fixture_dir:
+            for data_format_ in SUPPORTED_DATA_FORMATS:
+                _write_fixture(Path(fixture_dir), data_format=data_format_)
+                fixture_store_manager = MASTStorageManager(data_format=data_format_, base_local_data_path=fixture_dir)
+                fixture_shot_info = ShotInfo(shot_id=FIXTURE_SHOT_ID, local=True)
+
+                fixture_store_ = fixture_store_manager.make_shot_store(shot_info=fixture_shot_info, verbose=True)
+                with fixture_store_manager.open_shot_group(data_origin=fixture_store_) as fixture_group:
+                    print(f"\n[{data_format_}] fixture_group.groups: {fixture_group.groups}")
+
+                fixture_all_signals = fixture_store_manager.get_all_signals_in_store(store=fixture_store_)
+                print(f"[{data_format_}] fixture_all_signals: {fixture_all_signals}\n")
 
     # ..................................................................................................................
 

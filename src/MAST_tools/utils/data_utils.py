@@ -3,11 +3,19 @@ Docstring reference: https://numpydoc.readthedocs.io/en/latest/format.html
 Python style reference: https://google.github.io/styleguide/pyguide.html
 """
 
+import os
 from collections.abc import Mapping
-from typing import Union, Any, TypedDict, Optional
+from typing import Union, Any, TypedDict, Optional, Literal
 from typing_extensions import NotRequired
-import zarr.storage
 from xarray.core.dataset import Dataset
+from xarray.core.datatree import DataTree
+
+
+# ======================================================================================================================
+# Data format types
+
+DataFormatType = Literal["zarr", "netcdf"]
+"""Supported on-disk/S3 data formats, both loaded via xarray."""
 
 
 # ======================================================================================================================
@@ -26,8 +34,14 @@ class StoreManagerParameters(TypedDict):
     s3_mast_dataset_path: NotRequired[str]
     """Path for the target MAST dataset within the configured S3 bucket."""
 
+    base_local_data_path: NotRequired[Optional[str]]
+    """Local root path used for local data pulling."""
+
     base_local_zarr_path: NotRequired[Optional[str]]
-    """Local root path used for local data pulling in Zarr format."""
+    """Deprecated alias for `base_local_data_path`, kept for backwards compatibility."""
+
+    data_format: NotRequired[DataFormatType]
+    """On-disk/S3 data format to load. Either "zarr" (default) or "netcdf"."""
 
 
 # ======================================================================================================================
@@ -53,8 +67,13 @@ ShotInfoType = Mapping[str, Any]
 StoreManagerParametersType = Mapping[str, Any]
 
 XarrayDatasetType = Dataset
-ZarrFSStoreType = zarr.storage.FsspecStore
-ZarrLocalStoreType = zarr.storage.LocalStore
-ZarrStoreType = Union[ZarrFSStoreType, ZarrLocalStoreType]
-BaseDataSourceType = Union[ShotInfoType, ZarrStoreType]
-ExtendedDataSourceType = Union[BaseDataSourceType, XarrayDatasetType]
+XarrayDataTreeType = DataTree
+
+DataSourceHandleType = Union[str, os.PathLike, Any]
+"""Backend-agnostic handle for a shot, as returned by `MASTStorageManager.make_shot_store()`: a local file path, an
+`fsspec` URI (e.g. "s3://..."), or a file-like object. It is opened via `xarray` with the engine matching the
+configured data format, so no format-specific store object is ever built. There is no single stable public type
+covering "file-like" across `fsspec`/`s3fs`, hence `Any`."""
+
+BaseDataSourceType = Union[ShotInfoType, DataSourceHandleType]
+ExtendedDataSourceType = Union[BaseDataSourceType, XarrayDatasetType, XarrayDataTreeType]
