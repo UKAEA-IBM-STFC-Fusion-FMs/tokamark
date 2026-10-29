@@ -26,7 +26,7 @@ graph TB
     MD -->|applies| TRANS
     CD -->|wraps| MD
     
-    STORE -->|reads from| S3[S3/Local Zarr]
+    STORE -->|reads from| S3[S3/Local Zarr or netCDF]
     
     USER[User/DataLoader] -->|accesses| CD
     USER -->|accesses| MD
@@ -111,7 +111,7 @@ item = cached_dataset[0]  # No reload!
 
 ### Purpose
 The core PyTorch `Dataset` implementation for MAST data. Handles:
-- Loading shot data from Zarr storage (local or S3)
+- Loading shot data via `xarray` (Zarr or netCDF, local or S3)
 - Applying signal-level transforms
 - Managing incomplete shots and outliers
 - Providing flexible data access patterns
@@ -126,7 +126,7 @@ class MastDataset(Dataset):
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `local` | `bool` | If `True`, use local Zarr files; else use S3 |
+| `local` | `bool` | If `True`, use local data files; else use S3 |
 | `shots_list` | `list[int]` | List of shot IDs to load |
 | `source_signal_list` | `list[list[str]]` | Signals to load as `[[source, signal], ...]` |
 | `signal_level_transform_map` | `Optional[Mapping[str, Callable]]` | Per-signal transforms (e.g., standardization) |
@@ -153,7 +153,7 @@ def __init__(
 **Parameter Details:**
 
 - **`local`**: Boolean flag for storage location
-  - `True`: Use local Zarr database
+  - `True`: Use local data database (Zarr or netCDF)
   - `False`: Use remote S3 bucket
   
 - **`shots_list`**: List of shot IDs to include in dataset
@@ -213,11 +213,11 @@ sequenceDiagram
     participant STORE as Storage
     
     User->>MD: __getitem__(idx)
-    MD->>STORE: make_shot_store(shot_id)
-    STORE-->>MD: store
+    MD->>STORE: open_shot_group(shot_id)
+    STORE-->>MD: shot_tree (xarray.DataTree)
     
     loop For each source
-        MD->>SIG: get_source_profiles(store, source)
+        MD->>SIG: get_source_profiles(shot_tree, source)
         SIG-->>MD: source_store
         
         loop For each signal in source
@@ -264,7 +264,7 @@ for source, signal in source_signal_to_load:
 3. **Signal Retrieval** (lines 296-343):
 ```python
 for source in source_signals:
-    source_store = self.sig.get_source_profiles(store, source)
+    source_store = self.sig.get_source_profiles(shot_tree, source)
     for signal in source_signals[source]:
         signal_profile = self.sig.get_signal_profile(source_store, signal)
         shot_time, _ = self.sig.get_signal_times_and_time_type(...)
@@ -554,7 +554,7 @@ except IndexError:
 
 ### I/O Optimization
 - **Grouped Reads**: Signals from same source loaded together
-- **Zarr Chunking**: Efficient partial array reads from chunked storage
+- **Chunked Reads**: Efficient partial array reads from chunked storage (Zarr chunks / netCDF HDF5 chunks)
 - **fsspec Caching**: Disk cache for remote data (simplecache protocol)
 - **Batch Operations**: Vectorized numpy operations
 
@@ -751,4 +751,4 @@ The [`MAST_dataset.py`](../src/MAST_tools/MAST_dataset.py) module provides:
 ✅ **Scalability**: Works with datasets from tens to thousands of shots  
 
 This module serves as the foundation for all data access in the FAIR-MAST benchmark framework, providing a clean and 
-efficient interface between raw Zarr storage and PyTorch training pipelines.
+efficient interface between the raw shot storage (Zarr or netCDF) and PyTorch training pipelines.

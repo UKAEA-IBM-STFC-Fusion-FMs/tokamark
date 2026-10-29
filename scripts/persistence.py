@@ -520,7 +520,7 @@ if __name__ == "__main__":
         config["persistence_settings"]["ar_tasks"] = [config["persistence_settings"]["ar_tasks"][0]]
 
     # REMARK: Default values for `store_manager_settings` can be overridden here as follows:
-    # config["store_manager_settings"]["base_local_zarr_path"] = "/path/to/local/zarr/dataset"
+    # config["store_manager_settings"]["base_local_data_path"] = "/path/to/local/dataset"
 
     # ------------------------------------------------------------------------------------------------------------------
     # Looping over auto-regressive tasks

@@ -46,11 +46,11 @@ Dynamics](https://arxiv.org/abs/2602.15084).
    ```bash
    pip install -e .
    ```
-4. **[OPTIONAL]** For experiments using a local Zarr database, download and install 
+4. **[OPTIONAL]** For experiments using a local database (Zarr or netCDF), download and install 
 the dataset under `/mast/tokamark/v1`. 
 
     * **REMARK:** Installation of the local dataset under a different directory is possible, but requires setting 
-    variable `DEFAULT_BASE_LOCAL_ZARR_PATH` in module `./src/MAST_tools/utils/store_utils.py` with the appropriate path. 
+    variable `DEFAULT_BASE_LOCAL_DATA_PATH` in module `./src/MAST_tools/utils/store_utils.py` with the appropriate path. 
 
 
 5. **[OPTIONAL]** For contributors, install dev dependencies and enable pre-commit hooks:
@@ -70,7 +70,7 @@ The pre-commit configuration runs `ruff check` and `ruff format`.
 graph TB
     subgraph "Data Sources"
         S3[S3 Remote Storage<br/>MAST Dataset]
-        LOCAL[Local Zarr Files<br/>Cached Data]
+        LOCAL[Local Data Files<br/>Cached Data]
     end
     
     subgraph "MAST_tools Package"
@@ -112,8 +112,9 @@ graph TB
 ### 1. Data Access Layer (`MAST_tools`)
 
 #### **MASTStorageManager** (`src/MAST_tools/utils/store_utils.py`)
-- **Purpose**: Manages access to MAST data stored in Zarr format
+- **Purpose**: Manages access to MAST data, stored either in Zarr or netCDF format
 - **Key Features**:
+  - Backend-agnostic: all reads go through `xarray`, selected by the `data_format` setting (`"zarr"` or `"netcdf"`)
   - Supports both local and remote (S3) data sources
   - Uses `fsspec` for filesystem abstraction
   - Implements caching with `simplecache` protocol
@@ -121,12 +122,13 @@ graph TB
 - **Configuration**:
   - S3 endpoint: `https://s3.echo.stfc.ac.uk`
   - Dataset path: `/mast/tokamark/v1`
-  - Local cache path: `/mast/tokamark/v1`
+  - Local data path: `/mast/tokamark/v1`
 - **Key Methods**:
   - `list_all_shots()`: List available shot IDs
   - `list_shots_by_signal_availability()`: Filter shots by signal availability
-  - `make_shot_store()`: Create Zarr store for a shot
-  - `make_shot_group()`: Create Zarr group for a shot
+  - `make_shot_store()`: Create the data source handle (local path or remote URI) for a shot
+  - `make_shot_group()`: Open a shot as an `xarray.DataTree` (one child node per source)
+  - `open_shot_group()`: Same as above, as a context manager that closes the tree on exit
   - `get_all_signals_in_store()`: List all signals in a store
 
 #### **MASTSignalManager** (`src/MAST_tools/utils/signal_utils.py`)
@@ -260,7 +262,7 @@ test_pipeline.py (Script)
     │               │       │       │
     │               │       │       └─► MASTStorageManager.make_shot_store()
     │               │       │               │
-    │               │       │               └─► Read from Zarr (S3/Local)
+    │               │       │               └─► Read via xarray (Zarr/netCDF, S3/Local)
     │               │       │
     │               │       └─► Apply signal transforms
     │               │
@@ -305,7 +307,7 @@ sequenceDiagram
     TokaMark->>MastDS: Request shot data
     MastDS->>SigMgr: Get signals
     SigMgr->>StoreMgr: Fetch from storage
-    StoreMgr->>Storage: Read Zarr data
+    StoreMgr->>Storage: Read data via xarray
     Storage-->>StoreMgr: Return data
     StoreMgr-->>SigMgr: Return data
     SigMgr-->>MastDS: Apply transforms
@@ -323,7 +325,7 @@ sequenceDiagram
 ## Key Design Patterns
 
 ### 1. **Layered Architecture**
-- **Storage Layer**: `MASTStorageManager` - Handles Zarr data access
+- **Storage Layer**: `MASTStorageManager` - Handles data access via `xarray`
 - **Signal Layer**: `MASTSignalManager` - Processes signals
 - **Dataset Layer**: `MastDataset`, `TokaMarkDataset` - PyTorch integration
 - **Application Layer**: Scripts and notebooks - User interface
@@ -343,7 +345,7 @@ sequenceDiagram
 ### 4. **Lazy Loading & Caching**
 - `CachedDataset` for memory caching
 - `fsspec` simplecache for disk caching
-- On-demand data loading from Zarr stores
+- On-demand data loading from the shot data store
 - Reduces memory footprint and I/O operations
 
 ### 5. **Iterator Pattern**
@@ -357,7 +359,7 @@ sequenceDiagram
 ## Technology Stack
 
 ### Core Dependencies
-- **Data Storage**: `zarr`, `fsspec`, `s3fs`, `xarray`
+- **Data Storage**: `xarray` (+ `zarr` / `h5netcdf` backends), `fsspec`, `s3fs`
 - **ML Framework**: `torch`, `torchvision`, `tensordict`
 - **Scientific Computing**: `numpy`, `scikit-learn`
 - **Visualization**: `matplotlib`, `seaborn`, `opencv-python`
@@ -365,7 +367,7 @@ sequenceDiagram
 - **Development**: `jupyter`, `black`, `pytest`
 
 ### Data Format
-- **Primary**: Zarr (chunked, compressed array storage)
+- **Primary**: Zarr (chunked, compressed array storage); netCDF also supported via `data_format="netcdf"`
 - **Metadata**: YAML, CSV
 - **Artifacts**: CSV (statistics, metrics)
 
@@ -559,7 +561,7 @@ compute_summary_metrics(
 ### 4. **Storage Backends**
 1. Modify `MASTStorageManager` in `store_utils.py`
 2. Add new filesystem protocol support
-3. Update `_get_store_from_data_origin()` method
+3. Update `_shot_uri()` (handle construction) and `_open_kwargs()` (engine/storage options) methods
 
 ### 5. **Custom Models**
 1. Create model-specific transform class
@@ -581,7 +583,7 @@ compute_summary_metrics(
 - Configurable buffer size for shuffle operations
 
 ### 3. **I/O Optimization**
-- Zarr format provides chunked, compressed storage
+- Zarr format provides chunked, compressed storage; netCDF reads use the `h5netcdf` engine
 - S3 access optimized with fsspec caching
 - Local mode bypasses network I/O
 
@@ -597,7 +599,7 @@ compute_summary_metrics(
 1. **User Request** → `test_pipeline.py` specifies task and shots
 2. **Task Configuration** → Load YAML config with input/output signals
 3. **Dataset Creation** → `initialize_MAST_dataset()` creates `MastDataset`
-4. **Storage Setup** → `MASTStorageManager` connects to S3 or local Zarr
+4. **Storage Setup** → `MASTStorageManager` connects to S3 or the local database
 5. **Signal Retrieval** → `MASTSignalManager` fetches and processes signals
 6. **Transform Application** → Apply standardization, reshaping, etc.
 7. **Batch Creation** → PyTorch DataLoader collates batches
@@ -660,11 +662,12 @@ See [License file](LICENSE.md).
 ### Project Highlights
 - **Project Repository**: `tokamark`
 - **Data Source**: MAST Tokamak (Mega Ampere Spherical Tokamak)
-- **Storage Format**: Zarr v3.1.5
+- **Storage Format**: Zarr v3.1.5 (default) or netCDF, both read via `xarray`
 - **ML Framework**: PyTorch
 - **Documentation Standards**: NumPy docstring format, Google Python style guide
 
 ### External Documentation
+- **Xarray Documentation**: https://docs.xarray.dev/
 - **Zarr Documentation**: https://zarr.readthedocs.io/
 - **fsspec Documentation**: https://filesystem-spec.readthedocs.io/
 - **PyTorch Dataset**: https://pytorch.org/docs/stable/data.html

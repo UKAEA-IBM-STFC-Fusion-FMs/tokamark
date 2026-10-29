@@ -5,7 +5,6 @@ Python style reference: https://google.github.io/styleguide/pyguide.html
 
 import time
 import numpy as np
-import xarray as xr
 from typing import Union, Optional, Any
 
 from MAST_tools.utils.data_utils import (
@@ -38,6 +37,8 @@ class MASTSignalManager:
     -------
     _set_store_manager(store_manager)
         Set the store_manager instance attribute.
+    _get_source_dataset(data_origin, source_name, verbose)
+        Get a source group as an xarray Dataset from a given data origin.
     get_source_profiles(data_origin, source_name)
         Get source profiles from a given data origin.
     get_signal_values(signal_name, data_origin, source_name, verbose)
@@ -101,6 +102,52 @@ class MASTSignalManager:
         self.store_manager = store_manager
 
     # ------------------------------------------------------------------------------------------------------------------
+    def _get_source_dataset(
+        self,
+        data_origin: Any,
+        source_name: str | None,
+        verbose: bool = False,
+    ) -> XarrayDatasetType | None:
+        """
+        Get a source group as an xarray Dataset from a given data origin.
+
+        The data origin is resolved to an `xarray.DataTree` via `MASTStorageManager.make_shot_group()` (which is
+        backend-agnostic and idempotent for an already opened tree), and the source group is then read from it.
+
+        Parameters
+        ----------
+        data_origin : Any
+            Origin of data: shot info Mapping, data source handle (local path/remote URI/file-like object), or an
+            already opened `xarray.DataTree`.
+        source_name : str | None
+            Name of target source (group).
+        verbose : bool
+            If True, verbose mode is activated.
+            Default: False.
+
+        Returns
+        -------
+        XarrayDatasetType | None
+            Source dataset, or None if the group could not be found.
+
+        """
+
+        if source_name is None:
+            if verbose:
+                print("No `source_name` was provided, so no source group can be resolved.")
+            return None
+
+        profile = None
+        try:
+            shot_tree = self.store_manager.make_shot_group(data_origin=data_origin, verbose=verbose)
+            profile = shot_tree[source_name].dataset  # noqa - Ignore expected type warning
+        except (KeyError, OSError, AttributeError) as e:
+            if verbose:
+                print(f"Exception: {e}")
+
+        return profile
+
+    # ------------------------------------------------------------------------------------------------------------------
     def get_source_profiles(
         self, data_origin: BaseDataSourceType, source_name: str, verbose: bool = False
     ) -> XarrayDatasetType | None:
@@ -110,7 +157,8 @@ class MASTSignalManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for source profile creation, either Mapping or ZarrStoreType.
+            Origin of data for source profile creation: shot info Mapping, data source handle, or an already opened
+            `xarray.DataTree`.
         source_name : str
             Name of target source.
         verbose : bool
@@ -126,21 +174,7 @@ class MASTSignalManager:
 
         self.store_manager.check_data_origin(data_origin)
 
-        if isinstance(data_origin, dict):
-            # From shot info
-            store = self.store_manager.make_shot_store(shot_info=data_origin)
-        else:
-            # From store
-            store = data_origin
-
-        source_profile = None
-        try:
-            source_profile = xr.open_zarr(store=store, group=source_name)
-        except KeyError as e:
-            if verbose:
-                print(f"Exception: {e}")
-
-        return source_profile
+        return self._get_source_dataset(data_origin=data_origin, source_name=source_name, verbose=verbose)
 
     # ------------------------------------------------------------------------------------------------------------------
     def get_signal_values(
@@ -158,9 +192,10 @@ class MASTSignalManager:
         signal_name : str
             Name of the target signal.
         data_origin : ExtendedDataSourceType
-            Origin of data for signal value retrieval, either Mapping, ZarrStoreType, or XarrayDatasetType.
+            Origin of data for signal value retrieval: Mapping, data source handle, XarrayDataTreeType, or
+            XarrayDatasetType.
         source_name : str | None
-            Name of target source. If `data_origin` is a Zarr store, `source_name` must be provided.
+            Name of target source. It must be provided unless `data_origin` is already a source dataset.
             Optional. Default: None.
         verbose : bool
             If True, verbose mode is activated.
@@ -199,9 +234,10 @@ class MASTSignalManager:
         signal_name : str
             Name of the target signal.
         data_origin : ExtendedDataSourceType
-            Origin of data for signal value retrieval, either Mapping, ZarrStoreType, or XarrayDatasetType.
+            Origin of data for signal value retrieval: Mapping, data source handle, XarrayDataTreeType, or
+            XarrayDatasetType.
         source_name : str | None
-            Name of target source. If `data_origin` is a Zarr store, `source_name` must be provided.
+            Name of target source. It must be provided unless `data_origin` is already a source dataset.
             Optional. Default: None.
         verbose : bool
             If True, verbose mode is activated.
@@ -249,9 +285,10 @@ class MASTSignalManager:
         signal_name : str
             Name of the target signal.
         data_origin : ExtendedDataSourceType
-            Origin of data for signal value retrieval, either Mapping, ZarrStoreType, or XarrayDatasetType.
+            Origin of data for signal value retrieval: Mapping, data source handle, XarrayDataTreeType, or
+            XarrayDatasetType.
         source_name : str | None
-            Name of target source. If `data_origin` is a Zarr store, `source_name` must be provided.
+            Name of target source. It must be provided unless `data_origin` is already a source dataset.
             Optional. Default: None.
         verbose : bool
             If True, verbose mode is activated.
@@ -265,11 +302,11 @@ class MASTSignalManager:
         """
 
         if isinstance(data_origin, XarrayDatasetType):
-            # From group profile (i.e., xarray.core.dataset)
+            # From source profile (i.e., xarray.core.dataset)
             profile = data_origin
 
         else:
-            # From shot info or ZarrStoreType
+            # From shot info, a data source handle, or an already opened xarray.DataTree
 
             try:
                 self.store_manager.check_data_origin(data_origin=data_origin)  # noqa - Ignore expected type warning
@@ -277,19 +314,7 @@ class MASTSignalManager:
                 if verbose:
                     print(f"Exception: {e}")
 
-            if isinstance(data_origin, dict):
-                # From shot info
-                store = self.store_manager.make_shot_store(shot_info=data_origin)
-            else:
-                # From ZarrStoreType (ZarrFSStoreType or ZarrLocalStoreType)
-                store = data_origin
-
-            profile = None
-            try:
-                profile = xr.open_zarr(store=store, group=source_name)
-            except KeyError as e:
-                if verbose:
-                    print(f"Exception: {e}")
+            profile = self._get_source_dataset(data_origin=data_origin, source_name=source_name, verbose=verbose)
 
         if profile is not None:
             try:
@@ -318,9 +343,10 @@ class MASTSignalManager:
         signal_name : str
             Name of the target signal.
         data_origin : ExtendedDataSourceType
-            Origin of data for signal profile retrieval, either Mapping, ZarrStoreType, or XarrayDatasetType.
+            Origin of data for signal profile retrieval: Mapping, data source handle, XarrayDataTreeType, or
+            XarrayDatasetType.
         source_name : str | None
-            Name of target source. If `data_origin` is a Zarr store, `source_name` must be provided.
+            Name of target source. It must be provided unless `data_origin` is already a source dataset.
             Optional. Default: None.
         verbose : bool
             If True, verbose mode is activated.
@@ -346,7 +372,7 @@ class MASTSignalManager:
                 return None
         except Exception as e:
             if verbose:
-                print(f"Error opening Zarr store: {e}")
+                print(f"Error getting signal profile: {e}")
             return None
 
 
@@ -374,11 +400,12 @@ def tests() -> None:
         "signal_values_from_store": False,
         "signal_values_from_shot_info": False,
         "signal_times_from_shot_info": True,
+        "storage_fixture": False,  # -> See `tests/test_storage.py` for fixture generation.
     }
 
-    base_local_zarr_path = "/mast/tokamark/v1"  # -> REMARK: Use correct local folder for local tests.
+    base_local_data_path = "/mast/tokamark/v1"  # -> REMARK: Use correct local folder for local tests.
     signal_manager = MASTSignalManager(
-        store_manager_settings=StoreManagerParameters(base_local_zarr_path=base_local_zarr_path)
+        store_manager_settings=StoreManagerParameters(base_local_data_path=base_local_data_path)
     )
 
     # print(type(signal_manager.store_manager))
@@ -428,6 +455,30 @@ def tests() -> None:
 
         print(f"Signal type: '{signal_type}'\n")
         print(f"Signal times: {signal_times}\n")
+
+    # ..................................................................................................................
+    # Run against the synthetic fixtures generated by `tests/test_storage.py`, for both data formats.
+
+    if TESTS_TO_RUN["storage_fixture"]:
+        import tempfile
+        from pathlib import Path
+
+        from tests.test_storage import FIXTURE_SHOT_ID, _write_fixture
+
+        with tempfile.TemporaryDirectory() as fixture_dir:
+            for data_format_ in ("netcdf", "zarr"):
+                _write_fixture(Path(fixture_dir), data_format=data_format_)
+                fixture_signal_manager = MASTSignalManager(
+                    store_manager_settings=StoreManagerParameters(
+                        data_format=data_format_, base_local_data_path=fixture_dir
+                    )
+                )
+                fixture_shot_info = ShotInfo(shot_id=FIXTURE_SHOT_ID, local=True)
+
+                fixture_signal_values = fixture_signal_manager.get_signal_values(
+                    signal_name=signal_name, data_origin=fixture_shot_info, source_name=source_name, verbose=True
+                )
+                print(f"[{data_format_}] signal values: {fixture_signal_values}\n")
 
     # ..................................................................................................................
 

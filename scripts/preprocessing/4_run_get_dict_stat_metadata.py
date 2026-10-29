@@ -126,7 +126,7 @@ if __name__ == "__main__":
         args.signals_stats_saving_file_path = Path(OUTPUT_DIR) / f"dict_signals_stats{args.demo_suffix}.yaml"
 
     # REMARK: Default values for `store_manager_settings` can be overridden as follows:
-    # config["store_manager_settings"]["base_local_zarr_path"] = "/path/to/local/zarr/dataset"
+    # config["store_manager_settings"]["base_local_data_path"] = "/path/to/local/dataset"
 
     # ------------------------------------------------------------------------------------------------------------------
     # Specific Data Preprocessing for LCFS profiles

@@ -6,7 +6,8 @@ get_shots_settings:
   seed: 42
 
 store_manager_settings:  # To override default values in `src.MAST_tools.store_utils.MASTStorageManager.__init__`:
-  base_local_zarr_path: /mast/tokamark/v1  # REMARK: Only relevant when `local` above is true.
+  base_local_data_path: /mast/tokamark/v1  # REMARK: Only relevant when `local` above is true.
+  # data_format: zarr   # Optional: "zarr" (default) or "netcdf". Selects the format loaded via xarray.
 
 dataloader_settings:
   batch_size: 8

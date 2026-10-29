@@ -267,7 +267,7 @@ get_shots_settings:
   seed: 42
 
 store_manager_settings:
-  base_local_zarr_path: /mast/tokamark/v1
+  base_local_data_path: /mast/tokamark/v1
 
 dataloader_settings:
   batch_size: 10
@@ -527,7 +527,7 @@ if not contains_nans(data=last):
 
 ```python
 # Override default settings programmatically
-config["store_manager_settings"]["base_local_zarr_path"] = "/custom/path"
+config["store_manager_settings"]["base_local_data_path"] = "/custom/path"
 ```
 
 ### 2. Error Handling

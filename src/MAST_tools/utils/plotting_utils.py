@@ -13,8 +13,8 @@ from typing import Union, Optional
 from types import NoneType
 import warnings
 
-from MAST_tools.utils.data_utils import ShotInfo, BaseDataSourceType
-from MAST_tools.utils import store_utils, signal_utils
+from MAST_tools.utils.data_utils import ShotInfo, BaseDataSourceType, StoreManagerParametersType
+from MAST_tools.utils import signal_utils
 
 
 # ======================================================================================================================
@@ -56,7 +56,7 @@ class MASTPlottingManager:
     """
 
     # ------------------------------------------------------------------------------------------------------------------
-    def __init__(self, manager_id: str = "") -> None:
+    def __init__(self, manager_id: str = "", store_manager_settings: StoreManagerParametersType | None = None) -> None:
         """
         Initialize class attributes.
 
@@ -64,6 +64,11 @@ class MASTPlottingManager:
         ----------
         manager_id : str
             User defined manager ID. Default: "".
+        store_manager_settings : StoreManagerParametersType | None
+            Settings for the underlying store manager instance (e.g. `data_format`, `base_local_data_path`), provided
+            as a kwargs dictionary with keywords/value types as defined in
+            `MAST_tools.utils.data_utils.StoreManagerParameters`.
+            Optional. Default: None, which results in default `MASTStorageManager` settings.
 
         Returns
         -------
@@ -72,6 +77,7 @@ class MASTPlottingManager:
         """
 
         self.plot_manager_id = manager_id
+        self.sig = signal_utils.MASTSignalManager(store_manager_settings=store_manager_settings)
 
     # ------------------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -194,7 +200,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting, either Mapping or a data source handle.
         source_name : str
             Name of target source.
         signal_name : str
@@ -207,12 +213,19 @@ class MASTPlottingManager:
         -------
         None
 
+        Raises
+        ------
+        KeyError
+            If `source_name` not found.
+
         """
 
         self._check_fig_size(fig_size=fig_size)
 
-        store = store_utils.MASTStorageManager()._get_store_from_data_origin(data_origin=data_origin)  # noqa
-        profiles = xr.open_zarr(store, group=source_name)
+        profiles = self.sig.get_source_profiles(data_origin=data_origin, source_name=source_name)
+        if profiles is None:
+            raise KeyError(f"Group `{source_name}` not found.")
+
         self.plot_1d_profiles(profiles=profiles[signal_name], fig_size=fig_size)
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -225,7 +238,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for group plotting, either Mapping or ZarrStoreType.
+            Origin of data for group plotting, either Mapping or a data source handle.
         source_name : str
             Name of target source.
         fig_size : Optional[Union[list[int], set[int]]]
@@ -239,7 +252,7 @@ class MASTPlottingManager:
         Raises
         ------
         KeyError
-            If `source_name` not found in consolidated metadata.
+            If `source_name` not found.
 
         """
 
@@ -248,14 +261,11 @@ class MASTPlottingManager:
             "`%matplotlib notebook`header."
         )
 
-        store = store_utils.MASTStorageManager()._get_store_from_data_origin(data_origin=data_origin)  # noqa
-
         self._check_fig_size(fig_size=fig_size)
 
-        try:
-            profiles = xr.open_zarr(store, group=source_name)
-        except KeyError:
-            raise KeyError(f"Group `{source_name}` not found in consolidated metadata.")
+        profiles = self.sig.get_source_profiles(data_origin=data_origin, source_name=source_name)
+        if profiles is None:
+            raise KeyError(f"Group `{source_name}` not found.")
 
         n_rows = int(np.ceil(len(profiles.data_vars) / 2))
         _, axes = plt.subplots(nrows=n_rows, ncols=2, figsize=(8, 2 * n_rows) if fig_size is None else fig_size)
@@ -287,7 +297,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
@@ -310,7 +320,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
@@ -333,7 +343,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
@@ -356,7 +366,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
@@ -379,7 +389,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
@@ -405,7 +415,7 @@ class MASTPlottingManager:
         Parameters
         ----------
         data_origin : BaseDataSourceType
-            Origin of data for signal plotting, either Mapping or ZarrStoreType.
+            Origin of data for signal plotting: Mapping, data source handle, or an already opened `xarray.DataTree`.
         fig_size : Optional[Union[list[int], set[int]]]
             Size of target Matplotlib figure.
             Default: None.
