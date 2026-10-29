@@ -6,6 +6,7 @@ Python style reference: https://google.github.io/styleguide/pyguide.html
 from pathlib import Path
 from unittest.mock import patch
 
+import fsspec
 import numpy as np
 import pytest
 import xarray as xr
@@ -19,9 +20,9 @@ from MAST_tools.utils.store_utils import MASTStorageManager, is_remote_uri
 #
 # No real MAST data exists in this repo, so this suite generates a small synthetic `<shot_id>.nc` / `<shot_id>.zarr`
 # file per test, mirroring the per-shot-file / per-source-group layout of the real dataset, then exercises the
-# store/signal management layer against it. Local stores are written straight to `tmp_path`. Remote (S3) stores reuse
-# the same on-disk fixture as the object a real bucket would serve, and redirect `xarray.open_datatree` to it via
-# `unittest.mock.patch`, so no network access or S3 credentials are required to test the remote code path.
+# store/signal management layer against it. Remote Zarr tests redirect `xarray.open_datatree` to the local fixture.
+# The remote NetCDF test instead redirects filesystem resolution, exercising the real xarray/h5netcdf backend and
+# checking that S3 options reach fsspec. No network access or S3 credentials are required.
 
 FIXTURE_SHOT_ID = 99999
 DATA_FORMATS = ("netcdf", "zarr")
@@ -164,15 +165,18 @@ def test_shot_uri_local_vs_remote(tmp_path, data_format) -> None:
     assert is_remote_uri(remote_uri)
 
 
-def test_open_kwargs_storage_options_only_for_remote(tmp_path) -> None:
-    store_manager = MASTStorageManager(data_format="zarr", base_local_data_path=str(tmp_path))
+@pytest.mark.parametrize("data_format", DATA_FORMATS)
+def test_open_kwargs_storage_options_only_for_remote(tmp_path, data_format) -> None:
+    store_manager = MASTStorageManager(data_format=data_format, base_local_data_path=str(tmp_path))
+    extension = FILE_EXTENSIONS[data_format]
 
-    local_kwargs = store_manager._open_kwargs(handle=str(tmp_path / "30471.zarr"))
-    assert local_kwargs == {"engine": "zarr"}
+    local_kwargs = store_manager._open_kwargs(handle=str(tmp_path / f"30471{extension}"))
+    assert local_kwargs == {"engine": store_manager.engine, "create_default_indexes": False}
 
-    remote_kwargs = store_manager._open_kwargs(handle="s3://mast/tokamark/v1/30471.zarr")
+    remote_kwargs = store_manager._open_kwargs(handle=f"s3://mast/tokamark/v1/30471{extension}")
     assert remote_kwargs == {
-        "engine": "zarr",
+        "engine": store_manager.engine,
+        "create_default_indexes": False,
         "storage_options": {"anon": True, "endpoint_url": store_manager.s3_endpoint_url},
     }
 
@@ -321,6 +325,30 @@ def test_remote_zarr_signal_manager_read(tmp_path) -> None:
     assert signal_values.shape == (len(_CHANNELS), len(_TIME)), signal_values.shape
     assert time_type == "time"
     np.testing.assert_allclose(signal_times, _TIME)
+
+
+def test_remote_netcdf_passes_storage_options_to_filesystem(tmp_path) -> None:
+    """Exercise the real xarray/h5netcdf backend, replacing only remote filesystem resolution."""
+
+    fixture_path = _write_fixture(tmp_path, "netcdf")
+    store_manager = MASTStorageManager(data_format="netcdf", base_local_data_path=None)
+    store = store_manager.make_shot_store(ShotInfo(shot_id=FIXTURE_SHOT_ID, local=False))
+    local_fs = fsspec.filesystem("file")
+
+    with (
+        patch("fsspec.get_fs_token_paths", return_value=(local_fs, None, [str(fixture_path)])) as resolve,
+        store_manager.open_shot_group(store) as tree,
+    ):
+        expected_magnetics, expected_summary = _fixture_datasets()
+        np.testing.assert_allclose(tree["magnetics"]["flux_loop_flux"].values, expected_magnetics.flux_loop_flux.values)
+        np.testing.assert_allclose(tree["summary"]["power_nbi"].values, expected_summary.power_nbi.values)
+        np.testing.assert_allclose(tree["magnetics"]["time"].values, _TIME)
+
+    resolve.assert_called_once_with(
+        store,
+        mode="rb",
+        storage_options={"anon": True, "endpoint_url": store_manager.s3_endpoint_url},
+    )
 
 
 # ======================================================================================================================

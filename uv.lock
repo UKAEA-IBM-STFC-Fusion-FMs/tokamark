@@ -4193,7 +4193,7 @@ requires-dist = [
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
-    { name = "xarray", specifier = ">=2025.1.0" },
+    { name = "xarray", specifier = ">=2026.4.0" },
     { name = "zarr", specifier = "==3.1.5" },
 ]
 provides-extras = ["dev"]

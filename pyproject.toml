@@ -14,7 +14,7 @@ dependencies = [
   "zarr==3.1.5",
   "fsspec==2025.3.0",
   "s3fs==2025.3.0",
-  "xarray>=2025.1.0",
+  "xarray>=2026.4.0",  # DataTree index control and h5netcdf remote storage_options
   "h5netcdf",
   "h5py",
   "google_crc32c",
