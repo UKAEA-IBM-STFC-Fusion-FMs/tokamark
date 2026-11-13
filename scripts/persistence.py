@@ -5,36 +5,36 @@ Python style reference: https://google.github.io/styleguide/pyguide.html
 
 import argparse
 import os
-from pathlib import Path
-from collections.abc import Mapping
-from typing import Any, Sequence, cast, Literal
-import numpy as np
-from multiprocessing import cpu_count
-import psutil
+from collections.abc import Mapping, Sequence
 from datetime import datetime
+from multiprocessing import cpu_count
+from pathlib import Path
+from typing import Any, Literal, cast
 
+import numpy as np
+import psutil
 import torch
+import torch.multiprocessing as mp
 from torch import Tensor as TorchTensor
 from torch.utils.data import DataLoader
-from torch.utils.data._utils.collate import default_collate  # noqa - Ignore "access to protected method" warning
-import torch.multiprocessing as mp
+from torch.utils.data._utils.collate import default_collate
 
 from MAST_tools.utils.general_utils import warning_print
 from MAST_tools.utils.path_utils import (
     RANDOM_SPLIT_OUTLIER_METADATA_FILE,
     TEMPORAL_SPLIT_OUTLIER_METADATA_FILE,
 )
-from tokamark.tools.utils import get_config_from_yaml
-from tokamark.tasks import get_task_config, get_task_metadata, get_signals_metadata
-from tokamark.data_split import get_train_test_val_shots
 from tokamark.data import initialize_MAST_dataset, initialize_TokaMark_dataset
+from tokamark.data_split import get_train_test_val_shots
 from tokamark.evaluator import WindowMetricsAccumulator, compute_metrics, compute_summary_metrics
+from tokamark.tasks import get_signals_metadata, get_task_config, get_task_metadata
 from tokamark.tools.path import (
-    RANDOM_SPLIT_TOKAMARK_DATA_SPLITS_FILE,
     RANDOM_SPLIT_SIGNALS_STATS_FILE,
-    TEMPORAL_SPLIT_TOKAMARK_DATA_SPLITS_FILE,
+    RANDOM_SPLIT_TOKAMARK_DATA_SPLITS_FILE,
     TEMPORAL_SPLIT_SIGNALS_STATS_FILE,
+    TEMPORAL_SPLIT_TOKAMARK_DATA_SPLITS_FILE,
 )
+from tokamark.tools.utils import get_config_from_yaml
 
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -117,9 +117,7 @@ class PersistenceTransform:
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-def MAST_collate_fn(  # noqa - Ignore lowercase warning
-    batch: Sequence, verbose: bool = True
-) -> list | None:
+def MAST_collate_fn(batch: Sequence, verbose: bool = True) -> list | None:
     """
     MAST collate function.
 
@@ -221,7 +219,7 @@ def persistence_evaluation_loop(  # NOSONAR - Ignore cognitive complexity
     """
 
     # ..................................................................................................................
-    def contains_nans(data: Any) -> bool:  # noqa - Ignore unused function warning
+    def contains_nans(data: Any) -> bool:
         """Check if given data contains NaN values."""
         return any(np.isnan(x_).any() for x_ in data)
 
@@ -236,7 +234,7 @@ def persistence_evaluation_loop(  # NOSONAR - Ignore cognitive complexity
             warning_print(f"Empty batch {batch_idx} skipped.")
             continue
 
-        shot_ids, window_indices, x_test, y_test = batch_  # noqa - Right number of values to unpack
+        shot_ids, window_indices, x_test, y_test = batch_
 
         print(f"\n-> Processing batch {batch_idx} with {len(shot_ids.unique())} shots and {len(shot_ids)} elements.")
 
@@ -324,16 +322,16 @@ def run_persistence_pipeline(
     if split == "random":
         print("Random splitting")
 
-        DATA_SPLIT = RANDOM_SPLIT_TOKAMARK_DATA_SPLITS_FILE  # noqa - Ignore lowercase warning
-        OUTLIER_FILE = RANDOM_SPLIT_OUTLIER_METADATA_FILE  # noqa - Ignore lowercase warning
-        SIGNAL_STATS = RANDOM_SPLIT_SIGNALS_STATS_FILE  # noqa - Ignore lowercase warning
+        DATA_SPLIT = RANDOM_SPLIT_TOKAMARK_DATA_SPLITS_FILE
+        OUTLIER_FILE = RANDOM_SPLIT_OUTLIER_METADATA_FILE
+        SIGNAL_STATS = RANDOM_SPLIT_SIGNALS_STATS_FILE
 
     elif split == "temporal":
         print("Temporal splitting")
 
-        DATA_SPLIT = TEMPORAL_SPLIT_TOKAMARK_DATA_SPLITS_FILE  # noqa - Ignore lowercase warning
-        OUTLIER_FILE = TEMPORAL_SPLIT_OUTLIER_METADATA_FILE  # noqa - Ignore lowercase warning
-        SIGNAL_STATS = TEMPORAL_SPLIT_SIGNALS_STATS_FILE  # noqa - Ignore lowercase warning
+        DATA_SPLIT = TEMPORAL_SPLIT_TOKAMARK_DATA_SPLITS_FILE
+        OUTLIER_FILE = TEMPORAL_SPLIT_OUTLIER_METADATA_FILE
+        SIGNAL_STATS = TEMPORAL_SPLIT_SIGNALS_STATS_FILE
 
     else:
         raise ValueError(f"Unknown split: {split}")
@@ -439,7 +437,7 @@ def run_persistence_pipeline(
         )
 
         test_dataloader = DataLoader(
-            dataset=test_dataset,  # noqa - Ignore expected type warning
+            dataset=test_dataset,
             collate_fn=MAST_collate_fn,
             **pipeline_config["dataloader_settings"],
         )
@@ -466,6 +464,8 @@ def run_persistence_pipeline(
             task=task,
             output_dir=Path(pipeline_config["persistence_settings"]["output_dir"]) / split,
             window_metrics_accumulator=accumulator,
+            normalization=True,
+            normalization_path=SIGNAL_STATS,
             save_windows_metrics=pipeline_config["persistence_settings"]["save_windows_metrics"],
             save_task_metrics=pipeline_config["persistence_settings"]["save_task_metrics"],
         )
@@ -528,22 +528,24 @@ if __name__ == "__main__":
 
     output_dir = Path(config["persistence_settings"]["output_dir"]) / args.split
 
-    print(f"Start time: {datetime.now()}\n")
+    print(f"Start time: {datetime.now().astimezone()}\n")
 
     for task_ in config["persistence_settings"]["ar_tasks"]:
         print("---------------------------------------------")
         print(f"Running persistence pipeline for {task_}, model `{args.persistence_model}`...\n")
         run_persistence_pipeline(task=task_, split=args.split, pipeline_config=config)
-        print(f"\nFinished `{args.persistence_model}` pipeline for {task_} [{datetime.now()}].")
+        print(f"\nFinished `{args.persistence_model}` pipeline for {task_} [{datetime.now().astimezone()}].")
         print("=========================================================\n")
 
     if config["persistence_settings"]["compute_summary_metrics"]:
         print("---------------------------------------------------------")
         print(f"Computing all metrics for `{args.persistence_model}` pipeline....\n")
         compute_summary_metrics(output_dir=output_dir)
-        print(f"\nFinished computation of all metrics for `{args.persistence_model}` pipeline [{datetime.now()}].")
+        print(
+            f"\nFinished computation of all metrics for `{args.persistence_model}` pipeline [{datetime.now().astimezone()}]."
+        )
         print("=========================================================\n\n")
 
-    print(f"\nAll done. Results saved under the target directory `{output_dir}` [{datetime.now()}].")
+    print(f"\nAll done. Results saved under the target directory `{output_dir}` [{datetime.now().astimezone()}].")
 
     # ------------------------------------------------------------------------------------------------------------------

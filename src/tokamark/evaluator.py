@@ -8,6 +8,9 @@ Typical usage:
 1. During inference, create `WindowMetricsAccumulator(task)` and call `add_batch(...)` for each model batch.
 2. After one task is complete, call:
    `compute_metrics(task, output_dir, window_metrics_accumulator, ...)`.
+   Normalization is disabled by default. To also compute NRMSE/NMAE, pass
+   `normalization=True, normalization_path=<reference statistics YAML>`.
+   The caller selects the reference; the evaluator never infers a split or a default statistics path.
    Default save flags are:
    - `save_windows_metrics=False`
    - `save_shot_metrics=False`
@@ -23,6 +26,8 @@ Typical usage:
    - `source="task_metrics"` (default): reads `task_metrics.csv` per task
    - `source="windows_metrics"`: reads `windows_metrics.csv` per task
    - `source="shots_metrics"`: reads `shots_metrics.csv` per task
+   Window CSVs can be normalized with the same explicit options as `compute_metrics`.
+   Task/shot CSVs retain their stored metrics; normalization options must be omitted for those sources.
 
 Aggregation follows the benchmark hierarchy:
 - signal rows: equal-weight mean/std across shots
@@ -31,11 +36,13 @@ Aggregation follows the benchmark hierarchy:
 """
 
 import os.path
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
-import pandas as pd
-import numpy as np
-from typing import Union, Any, Optional, Literal, cast
+from typing import Any, Literal, cast
 
+import numpy as np
+import pandas as pd
 from torch import Tensor as TorchTensor
 
 from tokamark.tasks import GROUP_TASKS, TASKS_CONFIGS_MAP, get_signals_metadata
@@ -68,8 +75,8 @@ GROUP_METRICS_FILENAME = "groups_metrics.csv"
 def compute_windows_metrics(
     y_target: np.ndarray,
     y_pred: np.ndarray,
-    shot_ids: Union[np.ndarray, TorchTensor],
-    window_indices: Union[np.ndarray, TorchTensor],
+    shot_ids: np.ndarray | TorchTensor,
+    window_indices: np.ndarray | TorchTensor,
     feature_name: str,
 ) -> pd.DataFrame:
     """
@@ -165,8 +172,8 @@ class WindowMetricsAccumulator:
         self,
         y_target: np.ndarray,
         y_pred: np.ndarray,
-        shot_ids: Union[np.ndarray, TorchTensor],
-        window_indices: Union[np.ndarray, TorchTensor],
+        shot_ids: np.ndarray | TorchTensor,
+        window_indices: np.ndarray | TorchTensor,
         feature_name: str,
     ) -> None:
         """
@@ -339,8 +346,8 @@ def _build_group_summary_from_task_summaries(df_tasks: pd.DataFrame) -> dict[str
 
 # ----------------------------------------------------------------------------------------------------------------------
 def _extract_task_summary_from_task_metrics(
-    task: str, output_dir: Union[str, Path]
-) -> Union[tuple[None, None], tuple[dict[str, Any], pd.DataFrame]]:
+    task: str, output_dir: str | Path
+) -> tuple[None, None] | tuple[dict[str, Any], pd.DataFrame]:
     """
     Return one task summary row along with signal rows from the task metrics CSV file defined in
     `TASK_METRICS_FILENAME`.
@@ -364,7 +371,7 @@ def _extract_task_summary_from_task_metrics(
         print(f"Warning: task {task} was yet evaluated, the corresponding files were not found.")
         return None, None
 
-    df = pd.read_csv(file_path)  # noqa - Ignore missing parameter(s)
+    df = pd.read_csv(str(file_path))
     df = cast(pd.DataFrame, df)
     if "feature_name" not in df.columns:
         print(f"Warning: {file_path} has no feature_name column. Skipping task {task}.")
@@ -398,7 +405,7 @@ def _extract_task_summary_from_task_metrics(
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-def _extract_task_summary_from_shots_metrics(task: str, output_dir: Union[str, Path]) -> Optional[dict[str, Any]]:
+def _extract_task_summary_from_shots_metrics(task: str, output_dir: str | Path) -> dict[str, Any] | None:
     """
     Load one task summary row from the shots metrics CSV file defined in `SHOT_METRICS_FILENAME`.
 
@@ -421,7 +428,7 @@ def _extract_task_summary_from_shots_metrics(task: str, output_dir: Union[str, P
         print(f"Warning: task {task} was yet evaluated, the corresponding files were not found.")
         return None
 
-    df = pd.read_csv(file_path)  # noqa - Ignore missing parameter(s)
+    df = pd.read_csv(str(file_path))
     df = cast(pd.DataFrame, df)
     if "shot_id" not in df.columns:
         print(f"Warning: data loaded from {file_path} has no shot_id column. Skipping task {task}.")
@@ -441,8 +448,8 @@ def _extract_task_summary_from_shots_metrics(task: str, output_dir: Union[str, P
 
 # ----------------------------------------------------------------------------------------------------------------------
 def _extract_task_summary_from_windows_metrics(
-    task: str, output_dir: Union[str, Path]
-) -> Union[tuple[None, None], tuple[dict[str, Any], pd.DataFrame]]:
+    task: str, output_dir: str | Path, signal_std: Mapping[str, Any] | None = None
+) -> tuple[None, None] | tuple[dict[str, Any], pd.DataFrame]:
     """
     Return one task summary row along with signal rows from the windows metrics CSV file defined in
     `WINDOW_METRICS_FILENAME`.
@@ -453,6 +460,9 @@ def _extract_task_summary_from_windows_metrics(
         Target task.
     output_dir : Union[str, Path]
         Target output directory.
+    signal_std : Mapping[str, Any] | None
+        Loaded reference statistics, or None to leave normalized metrics as NaN.
+        Optional. Default: None.
 
     Returns
     -------
@@ -466,9 +476,9 @@ def _extract_task_summary_from_windows_metrics(
         print(f"Warning: task {task} was yet evaluated, the corresponding files were not found.")
         return None, None
 
-    df = pd.read_csv(file_path)  # noqa - Ignore missing parameter(s)
+    df = pd.read_csv(str(file_path))
     df = cast(pd.DataFrame, df)
-    df_signals, df_task_shots, _ = aggregate_windows_metrics(df=df)
+    df_signals, df_task_shots, _ = _aggregate_windows_metrics(df=df, signal_std=signal_std)
     summary = {"task": task, **_build_task_summary_row_from_shots(df_task_shots=df_task_shots)}
     signal_rows = df_signals.reset_index().assign(task=task)
 
@@ -476,7 +486,52 @@ def _extract_task_summary_from_windows_metrics(
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _evaluation_signal_stats(normalization: bool, normalization_path: str | Path | None) -> Mapping[str, Any] | None:
+    """
+    Load an explicit evaluation reference only when normalization is enabled.
+
+    Parameters
+    ----------
+    normalization : bool
+        Whether normalized metrics are requested.
+    normalization_path : str | Path | None
+        Reference statistics YAML. Required when normalization is enabled;
+        must be None otherwise.
+
+    Returns
+    -------
+    Mapping[str, Any] | None
+        Signal statistics, or None without reading metadata when normalization is disabled.
+
+    Raises
+    ------
+    TypeError
+        If normalization is not a boolean or the loaded statistics are not a mapping.
+    ValueError
+        If the path is missing when required or provided with normalization disabled.
+
+    """
+    if not isinstance(normalization, bool):
+        raise TypeError("normalization must be a boolean.")
+    if not normalization:
+        if normalization_path is not None:
+            raise ValueError("normalization_path must be omitted when normalization=False.")
+        return None
+    if normalization_path is None or not str(normalization_path).strip():
+        raise ValueError("normalization=True requires an explicit normalization_path.")
+    stats = get_signals_metadata(file_path=str(normalization_path))
+    if not isinstance(stats, Mapping):
+        raise TypeError("Normalization statistics must be a mapping of signal names to statistics.")
+    return stats
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def aggregate_windows_metrics(
+    df: pd.DataFrame,
+    *,
+    normalization: bool = False,
+    normalization_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Aggregate window rows into signal-level and shot-level dataframes.
 
@@ -484,6 +539,12 @@ def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     ----------
     df : pd.DataFrame
         Input dataframe with windows metrics.
+    normalization : bool
+        Whether to compute NRMSE/NMAE in addition to physical-unit RMSE/MAE. Default: False.
+    normalization_path : str | Path | None
+        Explicit statistics YAML with a finite positive scalar std for every evaluated signal.
+        Required when normalization=True; forbidden otherwise. Keep the reference fixed across
+        reduced-data runs. These are evaluation references, not model preprocessing statistics.
 
     Returns
     -------
@@ -492,6 +553,31 @@ def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
 
     """
 
+    signal_std = _evaluation_signal_stats(normalization, normalization_path)
+    df_signals, df_task_shots, df_signals_shots = _aggregate_windows_metrics(df, signal_std)
+    return df_signals, df_task_shots, df_signals_shots
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def _aggregate_windows_metrics(
+    df: pd.DataFrame, signal_std: Mapping[str, Any] | None
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Aggregate window metrics using an already loaded evaluation reference.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe with window metrics.
+    signal_std : Mapping[str, Any] | None
+        Reference statistics, or None to leave normalized metrics as NaN.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        Signal, task-per-shot and signal-per-shot metrics.
+
+    """
     df = df.copy()
 
     # Be robust to string/object inputs from in-memory paths and CSV readers.
@@ -508,11 +594,20 @@ def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         # Back to RMSE: sqrt(mean(MSE_w)) gives the correct aggregated RMSE.
         df_signals_shots["RMSE"] = df_signals_shots["RMSE"] ** 0.5
 
-    # Normalize signals per shot.
-    signal_std = get_signals_metadata()
-    std = df_signals_shots["feature_name"].apply(lambda x: signal_std[x]["std"])
-    df_signals_shots["NRMSE"] = df_signals_shots["RMSE"] / std
-    df_signals_shots["NMAE"] = df_signals_shots["MAE"] / std
+    df_signals_shots["NRMSE"] = np.nan
+    df_signals_shots["NMAE"] = np.nan
+
+    # Normalize each signal before aggregating different physical quantities.
+    if signal_std is not None:
+        for name in df_signals_shots["feature_name"].unique():
+            if name not in signal_std or not isinstance(signal_std[name], Mapping) or "std" not in signal_std[name]:
+                raise ValueError(f"Missing evaluation standard deviation for signal {name!r}.")
+            value = signal_std[name]["std"]
+            if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Evaluation standard deviation for {name!r} must be finite and positive.")
+        std = df_signals_shots["feature_name"].apply(lambda x: signal_std[x]["std"])
+        df_signals_shots["NRMSE"] = df_signals_shots["RMSE"] / std
+        df_signals_shots["NMAE"] = df_signals_shots["MAE"] / std
 
     # Average signals scores across shots.
     n_shots_per_signal = df_signals_shots.groupby("feature_name")["shot_id"].nunique().rename("n_shots")
@@ -530,6 +625,8 @@ def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         .rename(columns=lambda c: f"{c}_std_pop")
     )
     df_signals = df_signals_mean.join(df_signals_std).join(n_shots_per_signal)
+    if signal_std is None:
+        df_signals[["NRMSE_std_pop", "NMAE_std_pop"]] = np.nan
 
     # Compute task-level score within each shot.
     df_task_shots = df_signals_shots.drop(columns=["feature_name"]).groupby(by=["shot_id"]).mean()
@@ -540,11 +637,14 @@ def aggregate_windows_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
 # ----------------------------------------------------------------------------------------------------------------------
 def compute_metrics(
     task: str,
-    output_dir: Union[Path, str],
+    output_dir: Path | str,
     window_metrics_accumulator: WindowMetricsAccumulator,
     save_windows_metrics: bool = False,
     save_shot_metrics: bool = False,
     save_task_metrics: bool = True,
+    *,
+    normalization: bool = False,
+    normalization_path: str | Path | None = None,
 ):
     """
     Compute one task metrics from an in-memory window metrics accumulator.
@@ -566,6 +666,12 @@ def compute_metrics(
     save_task_metrics: bool
         If True, save task metrics as pandas dataframe in the provided `output_dir` directory.
         Optional. Default: True.
+    normalization : bool
+        Whether to compute NRMSE/NMAE in addition to physical-unit RMSE/MAE. Default: False.
+    normalization_path : str | Path | None
+        Explicit statistics YAML with a finite positive scalar std for every evaluated signal.
+        Required when normalization=True; forbidden otherwise. Keep the reference fixed across
+        reduced-data runs. These are evaluation references, not model preprocessing statistics.
 
     Returns
     -------
@@ -585,7 +691,7 @@ def compute_metrics(
     """
 
     if task not in TASKS_CONFIGS_MAP:
-        print(f"Warning: task {task} is not known. Available tasks are: {str(TASKS_CONFIGS_MAP.keys())}.")
+        print(f"Warning: task {task} is not known. Available tasks are: {TASKS_CONFIGS_MAP.keys()!s}.")
 
     output_dir = Path(output_dir)
     task_output_dir = output_dir / task
@@ -595,9 +701,7 @@ def compute_metrics(
         raise ValueError("`window_metrics_accumulator` cannot be None in tokamark.evaluator.compute_metrics().")
 
     if not isinstance(window_metrics_accumulator, WindowMetricsAccumulator):
-        raise TypeError(  # noqa - Ignore unreached code warning
-            "`window_metrics_accumulator` must be a WindowMetricsAccumulator instance."
-        )
+        raise TypeError("`window_metrics_accumulator` must be a WindowMetricsAccumulator instance.")
 
     if window_metrics_accumulator.task != str(task):
         raise ValueError(
@@ -618,7 +722,9 @@ def compute_metrics(
     df = windows_df[COLUMNS].copy()
 
     # Compute signal and task level score within each shot.
-    df_signals, df_task_shots, df_signals_shots = aggregate_windows_metrics(df=df)
+    df_signals, df_task_shots, df_signals_shots = aggregate_windows_metrics(
+        df=df, normalization=normalization, normalization_path=normalization_path
+    )
     df_task_metrics = _build_task_metrics_df(task=task, df_signals=df_signals, df_task_shots=df_task_shots)
 
     if save_windows_metrics:
@@ -644,9 +750,12 @@ def compute_metrics(
 
 # ----------------------------------------------------------------------------------------------------------------------
 def compute_summary_metrics(  # NOSONAR - Ignore cognitive complexity
-    output_dir: Union[Path, str] = ".",
+    output_dir: Path | str = ".",
     source: Literal["task_metrics", "windows_metrics", "shots_metrics"] = "task_metrics",
     save_locally: bool = True,
+    *,
+    normalization: bool = False,
+    normalization_path: str | Path | None = None,
 ):
     """
     Aggregate all tasks into signal/group metrics from task/window/shot files.
@@ -662,6 +771,11 @@ def compute_summary_metrics(  # NOSONAR - Ignore cognitive complexity
     save_locally: bool
         If True, save metrics as pandas dataframes in the provided `output_dir` directory.
         Optional. Default: True.
+    normalization : bool
+        Enable normalization when recomputing source="windows_metrics". Default: False.
+        Task/shot sources preserve the metrics already present in their files and cannot be renormalized.
+    normalization_path : str | Path | None
+        Explicit reference YAML, required when normalization=True and forbidden otherwise.
 
     Returns
     -------
@@ -685,12 +799,20 @@ def compute_summary_metrics(  # NOSONAR - Ignore cognitive complexity
     if source not in ["task_metrics", "windows_metrics", "shots_metrics"]:
         raise ValueError("`source` must be one of: 'task_metrics', 'windows_metrics', 'shots_metrics'.")
 
+    if source != "windows_metrics" and (normalization or normalization_path is not None):
+        raise ValueError("Task/shot files are already aggregated; use source='windows_metrics' to normalize.")
+    signal_std = None
+    if source == "windows_metrics":
+        signal_std = _evaluation_signal_stats(normalization, normalization_path)
+
     for group_id in GROUP_TASKS:
         task_summaries = []
 
         for task in GROUP_TASKS[group_id]:
             if source == "windows_metrics":
-                task_summary, signal_rows = _extract_task_summary_from_windows_metrics(task=task, output_dir=output_dir)
+                task_summary, signal_rows = _extract_task_summary_from_windows_metrics(
+                    task=task, output_dir=output_dir, signal_std=signal_std
+                )
                 if task_summary is None:
                     continue
                 task_summaries.append(task_summary)
