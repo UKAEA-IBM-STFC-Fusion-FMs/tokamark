@@ -54,7 +54,7 @@ class ReshapeLcfsTransform:
                 resized_vector = np.full(shape=(170,), fill_value=np.nan)
             else:
                 scale_factor = 170 / len_cleaned_vector
-                resized_vector = zoom(input=cleaned_vector, zoom=scale_factor, order=1)  # order=1 -> linear interp.
+                resized_vector = zoom(input=cleaned_vector, zoom=scale_factor, order=1, mode="nearest")  # order=1 -> linear interp.
             new_profile.append(resized_vector)
 
         return {"time": time, "values": np.stack(new_profile).T}
